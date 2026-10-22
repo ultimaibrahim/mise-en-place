@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="mise" color="currentColor">
+  <title>mise</title>
+  <rect x="5" y="5" width="54" height="54" rx="14" fill="none" stroke="currentColor" stroke-width="3.5"/>
+  <path d="M23 5v54M41 5v54M5 23h54M5 41h54" stroke="currentColor" stroke-width="1.6" opacity=".45" fill="none"/>
+  <rect x="43" y="43" width="14" height="14" rx="3.5" fill="currentColor"/>
+</svg>

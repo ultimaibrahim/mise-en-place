@@ -1,0 +1,1058 @@
+/**
+ * ════════════════════════════════════════════════════════════════════════════
+ * 🚀 MISE KARDEX ENGINE — MOTOR INDEPENDIENTE DE AUDITORÍA, SYNC Y MANTENIMIENTO
+ * ════════════════════════════════════════════════════════════════════════════
+ * Módulo especializado de background para Bodega General:
+ * 1. MiseIdempotencyLedger + MiseSmartSync: descuento nocturno idempotente y reconciliación de días pasados.
+ * 2. MiseMatchingEngine: coincidencia de nombres (alias) para no perder filas al reordenar el Kardex.
+ * 3. MiseTraspasos: registro de traspasos entre bodegas.
+ */
+
+// ── 1. GESTOR DE IDEMPOTENCIA Y TRANSACCIONES PROCESADAS ─────────────────────
+const MiseIdempotencyLedger = {
+  _KEY: "PROCESSED_SURTIDO_TX_HASHES",
+
+  _getHashes() {
+    try {
+      const raw = PropertiesService.getScriptProperties().getProperty(this._KEY);
+      return raw ? JSON.parse(raw) : [];
+    } catch(e) {
+      return [];
+    }
+  },
+
+  _saveHashes(hashList) {
+    try {
+      // Conservar un buffer rotativo de los últimos 2000 hashes para evitar exceder cuota de Properties
+      const trimmed = hashList.slice(-2000);
+      PropertiesService.getScriptProperties().setProperty(this._KEY, JSON.stringify(trimmed));
+    } catch(e) {
+      MiseLogger.error("MiseIdempotencyLedger._saveHashes", e.message, e);
+    }
+  },
+
+  /** Carga la lista una sola vez por corrida (antes se releía y decodificaba por cada renglón). */
+  cargar() {
+    return new Set(this._getHashes());
+  },
+
+  registerBatch(txIds) {
+    if (!txIds || txIds.length === 0) return;
+    const current = this._getHashes();
+    const set = new Set([...current, ...txIds]);
+    this._saveHashes(Array.from(set));
+  }
+};
+
+// ── 2. MOTOR INTELIGENTE DE DESCUENTO DE INVENTARIO (SMARTSYNC) ───────────────
+const SMARTSYNC_LOG_VENTANA = 400; // renglones finales de 🗒 LOG_SURTIDO que revisa el respaldo (varias semanas de margen)
+const MiseSmartSync = {
+  /**
+   * Ejecuta el descuento con control de fecha (ayer en cronjob nocturno o fecha personalizada)
+   * e idempotencia transaccional P2P (conecta directamente a las tiendas PDA y PDM, descuenta en Kardex
+   * y vacía/resetea las cantidades de los pedidos en las tiendas).
+   */
+  // opciones (1.7.6l): soloRegistros → usa solo 🗒 LOG_SURTIDO y NUNCA lee ni vacía el pedido en curso (para días
+  // pasados: el pedido que está en la tienda es el de HOY); sinVistas → no reconstruye vistas ni hace push
+  // (quien llama lo hace una vez al final); sinHistorial → no se anota como cierre en la página de estado.
+  ejecutarDescuento(silent = true, fechaTargetPersonalizada = null, opciones = {}) {
+    const soloRegistros = !!opciones.soloRegistros;
+    // Monitor de progreso (1.7.7c): opciones.rep recibe un paso por bodega y uno para vistas/tiendas
+    const rep = opciones.rep || null;
+    const manual = opciones.manual != null ? !!opciones.manual : !silent;
+    const fueraDeSemana = [];
+    const tId = "MiseSmartSync.ejecutarDescuento_" + Date.now();
+    MiseLogger.time(tId);
+
+    const lock = LockService.getScriptLock();
+    if (!lock.tryLock(45000)) {
+      MiseLogger.warn("MiseSmartSync", "Bodega bloqueada por otro proceso concurrente.");
+      if (!silent) {
+        SpreadsheetApp.getUi().alert("⚠️ Advertencia", "Bodega ocupada por otro proceso. Intenta de nuevo en unos segundos.", SpreadsheetApp.getUi().ButtonSet.OK);
+      }
+      return;
+    }
+
+    let totalDescontados = 0;
+    let totalOmitidosDuplicados = 0;
+    let totalVaciadosTiendas = 0;
+    const resumenDesglose = [];
+    const txHashesAplicados = [];
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const props = PropertiesService.getScriptProperties();
+
+    const _norm = (str) => {
+      if (!str) return "";
+      return String(str).toLowerCase().replace(/\s+/g, "").replace(/cdk/g, "").replace(/[()]/g, "").trim();
+    };
+
+    const _fmtDateKey = (d) => {
+      if (!(d instanceof Date) || isNaN(d)) return "";
+      const y = d.getFullYear();
+      const m = String(d.getMonth() + 1).padStart(2, "0");
+      const day = String(d.getDate()).padStart(2, "0");
+      return `${y}-${m}-${day}`;
+    };
+
+    const _parseFecha = (raw) => {
+      if (raw instanceof Date) return raw;
+      if (typeof raw === "string") {
+        const clean = raw.trim();
+        if (clean.includes("-")) {
+          const parts = clean.split("-");
+          if (parts[0].length === 4) {
+            return new Date(parseInt(parts[0], 10), parseInt(parts[1], 10) - 1, parseInt(parts[2], 10));
+          }
+          if (parts[2].length === 4) {
+            return new Date(parseInt(parts[2], 10), parseInt(parts[1], 10) - 1, parseInt(parts[0], 10));
+          }
+        }
+        if (clean.includes("/")) {
+          const parts = clean.split("/");
+          if (parts[2].length === 4) {
+            return new Date(parseInt(parts[2], 10), parseInt(parts[1], 10) - 1, parseInt(parts[0], 10));
+          }
+          if (parts[0].length === 4) {
+            return new Date(parseInt(parts[0], 10), parseInt(parts[1], 10) - 1, parseInt(parts[2], 10));
+          }
+        }
+      }
+      return new Date(NaN);
+    };
+
+    // Tiempo por fase (se reporta en el 🗒 LOG para saber dónde se va el tiempo)
+    const fases = { tiendas: 0, log: 0, kardex: 0, vistas: 0, push: 0 };
+    let tFase = Date.now();
+    const _cerrarFase = (nombre) => { const t = Date.now(); fases[nombre] += t - tFase; tFase = t; };
+
+    try {
+      const ledger = MiseIdempotencyLedger.cargar();
+      // 1. Determinar Fecha Objetivo:
+      // Si corre a las 23:00 hrs (cierre nocturno) o en horario operativo, corresponde estrictamente a HOY.
+      // Únicamente si se ejecuta por reintento residual de madrugada (00:00 a 04:59 AM) hace fallback a AYER.
+      let fechaObjetivoDate;
+      if (fechaTargetPersonalizada instanceof Date) {
+        fechaObjetivoDate = fechaTargetPersonalizada;
+      } else {
+        const hoy = new Date();
+        if (hoy.getHours() < 5) {
+          fechaObjetivoDate = new Date(hoy);
+          fechaObjetivoDate.setDate(hoy.getDate() - 1);
+        } else {
+          fechaObjetivoDate = hoy;
+        }
+      }
+      const fechaObjetivoStr = _fmtDateKey(fechaObjetivoDate);
+
+      // Calcular columna SAL en el KARDEX:
+      // Fila 5 tiene los días, Fila 6 tiene ENT, SAL, SLD.
+      // LUN = d=0 -> ENT 10, SAL 11, SLD 12
+      // DOM = d=6 -> ENT 28, SAL 29, SLD 30
+      const dow = fechaObjetivoDate.getDay();
+      const dIdx = dow === 0 ? 6 : dow - 1; // 0 = LUN, ..., 6 = DOM
+      const salColIdx = 10 + dIdx * 3 + 1; // Subcolumna SAL exacta
+      const dayNames = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"];
+      const targetDayName = dayNames[dIdx];
+
+      // Mapear factores de conversión de MAESTRO para normalización automática de unidades
+      const maestroSheet = _hoja(ss, SHEET_MAESTRO);
+      const factorMap = {};
+      if (maestroSheet) {
+        const mlr = maestroSheet.getLastRow();
+        if (mlr >= MAESTRO_START) {
+          const mapM = _getMaestroHeaderMap(maestroSheet);
+          const cProdM = mapM["PRODUCTO"] ? mapM["PRODUCTO"].index : 2;
+          const cFactM = mapM["FACTOR_CONVERSION"] ? mapM["FACTOR_CONVERSION"].index : -1;
+          const cUTM = mapM["UNIDAD_TIENDA"] ? mapM["UNIDAD_TIENDA"].index : -1;
+          if (cFactM !== -1 && cUTM !== -1) {
+            const mData = maestroSheet.getRange(MAESTRO_START, 1, mlr - MAESTRO_START + 1, maestroSheet.getLastColumn()).getValues();
+            mData.forEach(r => {
+              const pKey = _norm(r[cProdM]);
+              let fact = r[cFactM];
+              if (typeof fact === "string") fact = fact.replace(',', '.').trim();
+              const numFact = parseFloat(fact);
+              // El factor solo aplica si el producto tiene UNIDAD DE PEDIDO (la tienda pide en esa unidad);
+              // sin ella la tienda ve y pide en la unidad de bodega (misma regla que _buildVista).
+              if (pKey && !isNaN(numFact) && numFact > 0 && String(r[cUTM] || "").trim()) {
+                factorMap[pKey] = numFact;
+              }
+            });
+          }
+        }
+      }
+
+      Object.keys(BODEGAS).forEach(key => {
+        const pasoB = `${BODEGAS[key].nombre}: pedidos y registros`;
+        if (rep) rep.inicio(pasoB);
+        const antes = totalDescontados, fueraAntes = fueraDeSemana.length, desgloseAntes = resumenDesglose.length;
+        try {
+          procesarBodega(key);
+        } catch (eB) {
+          if (rep) rep.fin(pasoB, false, eB.message);
+          throw eB;
+        }
+        if (rep) rep.fin(pasoB, true, fueraDeSemana.length > fueraAntes
+          ? "la fecha no está en la semana activa de su Inventario; no se descontó"
+          : `${totalDescontados - antes} insumo(s) descontado(s)` + (resumenDesglose.length > desgloseAntes
+            ? "\n" + resumenDesglose[resumenDesglose.length - 1].split("\n").slice(1, 16).map(l => l.trim()).join("\n") : ""));
+      });
+
+      function procesarBodega(key) {
+        const bConfig = BODEGAS[key];
+        const kSheet = _hoja(ss, bConfig.kardex);
+        if (!kSheet) return;
+
+        // Mapear insumos oficiales en Kardex (Columna C = 3 es Producto)
+        const klr = kSheet.getLastRow();
+        if (klr < KARDEX_START) return;
+        const kCount = klr - KARDEX_START + 1;
+        const kProds = kSheet.getRange(KARDEX_START, 3, kCount, 1).getValues();
+        const kRowMap = {};
+        kProds.forEach((r, idx) => {
+          const normKey = _norm(r[0]);
+          if (normKey) kRowMap[normKey] = KARDEX_START + idx;
+        });
+
+        // Guarda de semana por bodega: si la fecha no está en la semana ACTIVA de ESTE Kardex, no se descuenta ni se
+        // vacía nada (antes caía en la columna del mismo día de otra semana). La evidencia queda en 🗒 LOG_SURTIDO
+        // (la tienda la registra en su reset) y se aplica cuando el Kardex esté en la semana correcta.
+        const lunesK = _lunesSemanaActivaKardex(ss, key);
+        const objetivo0 = new Date(fechaObjetivoDate.getFullYear(), fechaObjetivoDate.getMonth(), fechaObjetivoDate.getDate());
+        const finK = new Date(lunesK.getFullYear(), lunesK.getMonth(), lunesK.getDate() + 7);
+        if (objetivo0 < lunesK || objetivo0 >= finK) {
+          fueraDeSemana.push(bConfig.nombre);
+          MiseLogger.warn("MiseSmartSync", `${bConfig.nombre}: ${fechaObjetivoStr} no está en la semana activa de ${bConfig.kardex} (lunes ${_fmtDateKey(lunesK)}); no se descuenta ni se vacía el pedido.`);
+          return;
+        }
+
+        const acumuladoPorProducto = {};
+        const listaDesgloseSucursal = [];
+        let remoteSs = null;
+        _cerrarFase("kardex");
+
+        // 2. Conectar directamente con la tienda remota (P2P)
+        const storeId = key === "BA" 
+          ? (props.getProperty("PDA_SPREADSHEET_ID") || props.getProperty("BODEGA_ID_BA"))
+          : (props.getProperty("PDM_SPREADSHEET_ID") || props.getProperty("BODEGA_ID_BM"));
+        const storeUrl = key === "BA"
+          ? (props.getProperty("BODEGA_URL_BA") || props.getProperty("PDA_SPREADSHEET_URL"))
+          : (props.getProperty("BODEGA_URL_BM") || props.getProperty("PDM_SPREADSHEET_URL"));
+
+        if (storeId) {
+          try { remoteSs = SpreadsheetApp.openById(storeId); } catch(e) {}
+        }
+        if (!remoteSs && storeUrl) {
+          try { remoteSs = _abrirLibro(storeUrl); } catch(e) {}
+        }
+
+        // A. Leer pedidos directamente de 📋 PEDIDO DIARIO de la tienda remota (y vaciarlo). Nunca en modo
+        //    soloRegistros: el pedido en la tienda es el de HOY, no el del día que se reconcilia.
+        if (remoteSs && !soloRegistros) {
+          try {
+            // Respaldo de Ground Truth: Leer directamente 🚚 SURTIDO RÁPIDO si está disponible
+            const surtidoMap = {};
+            try {
+              const surtidoSheet = _hoja(remoteSs, "🚚 SURTIDO RÁPIDO");
+              if (surtidoSheet && surtidoSheet.getLastRow() >= 4) {
+                const sCount = surtidoSheet.getLastRow() - 3;
+                const sData = surtidoSheet.getRange(4, 1, sCount, 8).getValues();
+                sData.forEach(sr => {
+                  const sProd = _norm(sr[2]); // Col C (PRODUCTO)
+                  let sRec = sr[4]; // Col E
+                  if (typeof sRec === "string") sRec = sRec.replace(',', '.').trim();
+                  sRec = parseFloat(sRec) || 0;
+                  const sComp = (sr[5] === true); // Col F (COMPLETO)
+                  const sInex = (sr[6] === true); // Col G (INEXISTENTE)
+                  // Col H (CANT. FINAL, fórmula de tienda v1.7.5+): fuente de verdad si trae número
+                  const sFinal = (sr[7] !== "" && sr[7] !== null && !isNaN(Number(sr[7]))) ? Number(sr[7]) : null;
+                  if (sProd) {
+                    surtidoMap[sProd] = { sRec, sComp, sInex, sFinal };
+                  }
+                });
+              }
+            } catch(errSurtido) {}
+
+            const pedidoSheet = _hoja(remoteSs, "📋 PEDIDO DIARIO");
+            if (pedidoSheet) {
+              const plr = pedidoSheet.getLastRow();
+              if (plr >= 4) {
+                const pCount = plr - 3;
+                const pData = pedidoSheet.getRange(4, 1, pCount, 11).getValues();
+                const itemsAEvidenciarEnLog = [];
+
+                pData.forEach((row, rowIdx) => {
+                  const prodName = String(row[2] || "").trim(); // Col C
+                  const catName = String(row[1] || "").trim();  // Col B
+                  const normKey = _norm(prodName);
+                  if (!normKey || !kRowMap[normKey]) return;
+
+                  let cantPed = row[5]; // Col F (CANT. A PEDIR)
+                  if (typeof cantPed === "string") cantPed = cantPed.replace(',', '.').trim();
+                  cantPed = parseFloat(cantPed) || 0;
+
+                  let cantRec = row[7]; // Col H (CANT. RECIBIDA)
+                  if (typeof cantRec === "string") cantRec = cantRec.replace(',', '.').trim();
+                  cantRec = parseFloat(cantRec) || 0;
+
+                  const estado = String(row[8] || "").trim().toUpperCase(); // Col I
+                  const sInfo = surtidoMap[normKey];
+
+                  // Determinar cantidad a descontar (tienda) con Doble Candado de Respaldo
+                  let cantDeducir = 0;
+                  if (sInfo && sInfo.sFinal !== null && sInfo.sFinal !== undefined) {
+                    cantDeducir = sInfo.sFinal;
+                  } else if (cantRec > 0) {
+                    cantDeducir = cantRec;
+                  } else if (sInfo && sInfo.sRec > 0) {
+                    cantDeducir = sInfo.sRec;
+                  } else if (estado.includes("INEXISTENTE") || (sInfo && sInfo.sInex)) {
+                    cantDeducir = 0;
+                  } else if (estado.includes("COMPLETO") || (sInfo && sInfo.sComp)) {
+                    // Si la celda de cantidad quedó vacía en tienda pero se marcó Completo
+                    cantDeducir = cantPed;
+                  }
+                  // Sin cantidad, sin ✅ y sin ❌: la tienda no registró recepción → no se descuenta nada
+
+                  if (cantDeducir > 0) {
+                    // Normalización automática de unidades: Si el insumo tiene factor de conversión (ej. Domo -> Kg), deducir la masa real
+                    const factor = factorMap[normKey] || 1;
+                    const cantDeducirKardex = Math.round(cantDeducir * factor * 1000) / 1000;
+
+                    const txHash = `${fechaObjetivoStr}_${key}_${normKey}_${cantDeducir}_pedido`;
+                    if (ledger.has(txHash)) {
+                      totalOmitidosDuplicados++;
+                    } else {
+                      acumuladoPorProducto[normKey] = (acumuladoPorProducto[normKey] || 0) + cantDeducirKardex;
+                      txHashesAplicados.push(txHash);
+                    }
+                  }
+
+                  if (cantPed > 0 || cantRec > 0 || cantDeducir > 0 || estado.length > 0 || (sInfo && (sInfo.sComp || sInfo.sInex))) {
+                    itemsAEvidenciarEnLog.push([
+                      fechaObjetivoStr,
+                      bConfig.nombre,
+                      prodName,
+                      catName,
+                      cantPed,
+                      cantDeducir,
+                      _estadoLogSurtido(estado, sInfo, cantPed, cantDeducir)
+                    ]);
+                  }
+                });
+
+                // Registrar evidencias en 🗒 LOG_SURTIDO de la tienda remota
+                if (itemsAEvidenciarEnLog.length > 0) {
+                  let remLogSheet = _hoja(remoteSs, "🗒 LOG_SURTIDO");
+                  if (!remLogSheet) {
+                    remLogSheet = remoteSs.insertSheet("🗒 LOG_SURTIDO");
+                    remLogSheet.getRange(1, 1, 1, 7).setValues([["Fecha", "Bodega", "Producto", "Categoría", "Cant.Pedida", "Cant.Recibida", "Estado"]])
+                      .setBackground("#3D5A47").setFontColor("#FFFFFF").setFontWeight("bold");
+                    remLogSheet.setFrozenRows(1);
+                  }
+                  _asegurarEncabezadoLogSurtido(remLogSheet);
+                  remLogSheet.getRange(Math.max(remLogSheet.getLastRow() + 1, 2), 1, itemsAEvidenciarEnLog.length, 7).setValues(itemsAEvidenciarEnLog);
+                }
+
+                // VACIAR Y RESETEAR PEDIDO DIARIO EN LA TIENDA
+                pedidoSheet.getRange(4, 6, pCount, 1).clearContent(); // Col F (CANT. A PEDIR)
+                pedidoSheet.getRange(4, 8, pCount, 2).clearContent(); // Col H y Col I (RECIBIDA y ESTADO)
+                // (La J ya no se limpia: en el esquema 3 de tienda es MÍN|MÁX; en el 2 está vacía y reservada)
+                
+                // Restaurar backgrounds institucionales
+                const bgs = [];
+                for (let i = 0; i < pCount; i++) {
+                  const rowBg = Array(10).fill(i % 2 === 0 ? "#FAFAFA" : "#FFFFFF"); // A:J en ambos esquemas
+                  rowBg[5] = "#FFFCD0"; // Col F
+                  rowBg[4] = "#D0E8FF"; // Col E
+                  bgs.push(rowBg);
+                }
+                pedidoSheet.getRange(4, 1, pCount, 10).setBackgrounds(bgs);
+
+                // Limpiar hoja 🚚 SURTIDO RÁPIDO remota
+                const surtidoRem = _hoja(remoteSs, "🚚 SURTIDO RÁPIDO");
+                if (surtidoRem) {
+                  try {
+                    remoteSs.deleteSheet(surtidoRem);
+                  } catch(e) {
+                    try {
+                      const sLr = surtidoRem.getLastRow();
+                      if (sLr >= 4) surtidoRem.getRange(4, 1, sLr - 3, surtidoRem.getMaxColumns()).clearContent().clearFormat().clearDataValidations();
+                    } catch(e2) {}
+                  }
+                }
+
+                totalVaciadosTiendas++;
+              }
+            }
+          } catch(eStore) {
+            MiseLogger.warn("MiseSmartSync", `Error procesando pedidos directos de ${bConfig.nombre}: ${eStore.message}`);
+          }
+        }
+
+        _cerrarFase("tiendas");
+
+        // B. Fallback / Complemento: Leer también de 🗒 LOG_SURTIDO (remoto o local _SYNC_LOG).
+        //    Solo los últimos renglones (el log crece para siempre y solo interesa la fecha objetivo);
+        //    logOffset mantiene el índice absoluto del renglón, que forma parte del hash de idempotencia.
+        let logRowsData = [];
+        let logOffset = 0;
+        const _leerColaLog = (hoja) => {
+          const lr = hoja.getLastRow();
+          if (lr < 2) return false;
+          const desde = Math.max(2, lr - SMARTSYNC_LOG_VENTANA + 1);
+          logOffset = desde - 2;
+          logRowsData = hoja.getRange(desde, 1, lr - desde + 1, 8).getValues();
+          return true;
+        };
+        if (remoteSs) {
+          const rLog = _hoja(remoteSs, "🗒 LOG_SURTIDO");
+          if (rLog) _leerColaLog(rLog);
+        }
+        if (logRowsData.length === 0) {
+          const localLog = _hoja(ss, `_SYNC_LOG_${key}`) || _hoja(ss, "🗒 LOG_SURTIDO");
+          if (localLog) _leerColaLog(localLog);
+        }
+
+        if (logRowsData.length > 0) {
+          logRowsData.forEach((lRow, idxCola) => {
+            const rowIdx = idxCola + logOffset;
+            const rowDate = _parseFecha(lRow[0]);
+            const rowDateStr = _fmtDateKey(rowDate);
+            if (rowDateStr !== fechaObjetivoStr) return;
+
+            const prodName = String(lRow[2] || "").trim();
+            const normKey = _norm(prodName);
+            if (!normKey || !kRowMap[normKey]) return;
+
+            let rawCant = lRow[5];
+            if (typeof rawCant === "string") rawCant = rawCant.replace(',', '.').trim();
+            const cantRec = parseFloat(rawCant) || 0;
+            const estado = String(lRow[6] || "").trim().toUpperCase();
+
+            if (!(estado.includes("COMPLETO") || estado.includes("PARCIAL") || cantRec > 0 || estado.includes("SURTIDO_AUTO"))) {
+              return;
+            }
+
+            const txHash = `${rowDateStr}_${key}_${normKey}_${cantRec}_r${rowIdx}`;
+            if (ledger.has(txHash)) {
+              totalOmitidosDuplicados++;
+              return;
+            }
+
+            // El renglón puede ser la evidencia de un descuento directo: de ESTA corrida o de una
+            // anterior (reintento de madrugada / botón manual). En ambos casos ya se descontó.
+            const directTxHash = `${rowDateStr}_${key}_${normKey}_${cantRec}_pedido`;
+            if (txHashesAplicados.includes(directTxHash)) {
+              return;
+            }
+            if (ledger.has(directTxHash)) {
+              totalOmitidosDuplicados++;
+              return;
+            }
+
+            const factor = factorMap[normKey] || 1;
+            const cantRecKardex = Math.round(cantRec * factor * 1000) / 1000;
+
+            acumuladoPorProducto[normKey] = (acumuladoPorProducto[normKey] || 0) + cantRecKardex;
+            txHashesAplicados.push(txHash);
+          });
+        }
+
+        _cerrarFase("log");
+
+        // 3. Inyección Acumulativa en Kardex: una sola lectura de la columna SAL del día y escrituras
+        //    solo en las celdas que cambian (sin lecturas intercaladas, que obligan a Google a aplicar
+        //    cada escritura pendiente antes de seguir).
+        const productosConDescuento = Object.keys(acumuladoPorProducto).filter(k => acumuladoPorProducto[k] > 0);
+        const salActual = productosConDescuento.length > 0
+          ? kSheet.getRange(KARDEX_START, salColIdx, kCount, 1).getValues() : [];
+        productosConDescuento.forEach(normKey => {
+          const targetRow = kRowMap[normKey];
+          const cantNueva = acumuladoPorProducto[normKey];
+
+          const valorActualCelda = parseFloat(salActual[targetRow - KARDEX_START][0]) || 0;
+          const valorFinal = Math.round((valorActualCelda + cantNueva) * 1000) / 1000;
+
+          kSheet.getRange(targetRow, salColIdx).setValue(valorFinal === 0 ? "" : valorFinal);
+
+          const nombreProductoOriginal = kProds[targetRow - KARDEX_START][0];
+          listaDesgloseSucursal.push(`  • [${targetDayName}] ${nombreProductoOriginal}: +${cantNueva} (Total SAL: ${valorFinal})`);
+          totalDescontados++;
+        });
+
+        _cerrarFase("kardex");
+        if (listaDesgloseSucursal.length > 0) {
+          resumenDesglose.push(`📍 ${bConfig.nombre.toUpperCase()} (${fechaObjetivoStr}):\n` + listaDesgloseSucursal.join("\n"));
+        }
+      }
+
+      // 4. Registrar hashes aplicados en el ledger
+      MiseIdempotencyLedger.registerBatch(txHashesAplicados);
+      SpreadsheetApp.flush();
+
+      // 5. Reconstruir vistas móviles para actualizar Stock Act
+      if (!opciones.sinVistas) try {
+        if (rep) rep.inicio("Vistas y tiendas al día");
+        _cerrarFase("kardex");
+        if (typeof _buildVista === "function") {
+          _buildVista("BA");
+          _buildVista("BM");
+        }
+        _cerrarFase("vistas");
+        if (typeof sincronizarRemotamenteTiendasPush === "function") {
+          sincronizarRemotamenteTiendasPush();
+        }
+        _cerrarFase("push");
+        if (rep) rep.fin("Vistas y tiendas al día", true, "");
+      } catch(eRebuild) {
+        if (rep) rep.fin("Vistas y tiendas al día", false, eRebuild.message);
+        MiseLogger.warn("MiseSmartSync", `Error refrescando vistas: ${eRebuild.message}`);
+      }
+
+      const dur = MiseLogger.timeEnd(tId);
+      const seg = (ms) => (ms / 1000).toFixed(1) + " s";
+      MiseLogger.info("MiseSmartSync", `Descuento completado: ${totalDescontados} insumos aplicados, ${totalOmitidosDuplicados} omitidos por idempotencia, ${totalVaciadosTiendas} tiendas vaciadas. Fases: tiendas ${seg(fases.tiendas)} · log ${seg(fases.log)} · kardex ${seg(fases.kardex)} · vistas ${seg(fases.vistas)} · push ${seg(fases.push)}.`, dur);
+      if (!opciones.sinHistorial) try {
+        _registrarCierre({ fecha: new Date().toISOString(), objetivo: fechaObjetivoStr, ok: true, manual, ms: dur, fases,
+          descontados: totalDescontados, omitidos: totalOmitidosDuplicados, tiendas: totalVaciadosTiendas });
+      } catch (eHist) {}
+
+      if (!silent) {
+        let msg = `Fecha procesada: ${fechaObjetivoStr} (${targetDayName})${soloRegistros ? " · solo desde registros (el pedido en curso no se toca)" : ""}\nInsumos descontados en Kardex: ${totalDescontados}\nTransacciones previas omitidas: ${totalOmitidosDuplicados}\nTiendas vaciadas y reseteadas: ${totalVaciadosTiendas}\n`;
+        if (fueraDeSemana.length) msg += `⚠️ Sin descontar (la fecha no está en la semana activa de su Kardex): ${fueraDeSemana.join(", ")}\n`;
+        msg += "\n";
+        if (resumenDesglose.length > 0) {
+          msg += resumenDesglose.join("\n\n");
+        } else {
+          msg += "No se encontraron nuevos pedidos o surtidos pendientes de descontar.";
+        }
+        SpreadsheetApp.getUi().alert("🚚 Descuento Inteligente y Vaciado de Pedidos", msg, SpreadsheetApp.getUi().ButtonSet.OK);
+      }
+
+      return {
+        totalDescontados,
+        totalOmitidosDuplicados,
+        totalVaciadosTiendas,
+        resumenDesglose,
+        fueraDeSemana
+      };
+
+    } catch(err) {
+      const dur = MiseLogger.timeEnd(tId);
+      MiseLogger.error("MiseSmartSync", `Error al descontar: ${err.message}`, err, dur);
+      try { _registrarCierre({ fecha: new Date().toISOString(), ok: false, manual, ms: dur, fases, error: String(err.message).substring(0, 200) }); } catch (eHist) {}
+      if (!silent) {
+        SpreadsheetApp.getUi().alert("❌ Error", `Ocurrió un error al descontar: ${err.message}`, SpreadsheetApp.getUi().ButtonSet.OK);
+      }
+      return {
+        totalDescontados: 0,
+        totalOmitidosDuplicados: 0,
+        totalVaciadosTiendas: 0,
+        resumenDesglose: [],
+        error: err.message
+      };
+    } finally {
+      lock.releaseLock();
+    }
+  },
+
+  /**
+   * Reconcilia y descuenta de forma retroactiva todos los pedidos y surtidos
+   * de los 7 días de la semana activa (Lunes a Domingo) en KARDEX_BA y KARDEX_BM.
+   */
+  /**
+   * Reconciliación NO destructiva (1.7.6l): recorre los días PASADOS de la semana activa de CADA Kardex y descuenta,
+   * solo desde 🗒 LOG_SURTIDO, lo que falte (idempotente: lo ya aplicado se omite). Nunca lee ni vacía el pedido en
+   * curso de las tiendas ni procesa hoy o días futuros (hoy lo cierra el descuento de las 23:00). Vistas y push, una vez.
+   * Antes: corría el descuento completo 7 veces desde el lunes, tomaba el pedido de HOY como si fuera del lunes, lo
+   * vaciaba en plena operación y usaba la semana de Andares para ambas bodegas.
+   */
+  reconciliarSemanaCompleta(silent = false, hoyRef = null, opciones = {}) {
+    const rep = opciones.rep || null;
+    const tId = "MiseSmartSync.reconciliarSemanaCompleta_" + Date.now();
+    MiseLogger.time(tId);
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const hoy = hoyRef instanceof Date ? hoyRef : new Date();
+    const hoy0 = new Date(hoy.getFullYear(), hoy.getMonth(), hoy.getDate());
+    const dayNames = ["Domingo", "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"];
+
+    // Días pasados de la semana activa de cada Kardex (las dos bodegas pueden ir en semanas distintas)
+    const fechas = {};
+    Object.keys(BODEGAS).forEach(key => {
+      const lunes = _lunesSemanaActivaKardex(ss, key);
+      for (let d = 0; d < 7; d++) {
+        const f = new Date(lunes.getFullYear(), lunes.getMonth(), lunes.getDate() + d);
+        if (f < hoy0) fechas[f.getTime()] = f;
+      }
+    });
+    const dias = Object.keys(fechas).sort().map(k => fechas[k]);
+
+    let granTotalDescontados = 0;
+    let granTotalOmitidos = 0;
+    const desgloseDias = [];
+    dias.forEach(f => {
+      const paso = `${dayNames[f.getDay()]} ${f.getDate()}/${f.getMonth() + 1}`;
+      if (rep) rep.inicio(paso);
+      const res = this.ejecutarDescuento(true, f, { soloRegistros: true, sinVistas: true, sinHistorial: true });
+      if (rep) rep.fin(paso, !!res && !res.error, !res ? "Bodega ocupada; no se revisó" : res.error ||
+        `${res.totalDescontados} descontado(s) · ${res.totalOmitidosDuplicados} ya aplicado(s)`);
+      if (!res) return;
+      granTotalDescontados += (res.totalDescontados || 0);
+      granTotalOmitidos += (res.totalOmitidosDuplicados || 0);
+      if (res.totalDescontados > 0) {
+        desgloseDias.push(`  • ${dayNames[f.getDay()]} ${f.getDate()}/${f.getMonth() + 1}: ${res.totalDescontados} insumos aplicados`);
+      }
+    });
+
+    if (granTotalDescontados > 0) {
+      if (rep) rep.inicio("Vistas y tiendas al día");
+      try {
+        if (typeof _buildVista === "function") { _buildVista("BA"); _buildVista("BM"); }
+        if (typeof sincronizarRemotamenteTiendasPush === "function") sincronizarRemotamenteTiendasPush();
+        if (rep) rep.fin("Vistas y tiendas al día", true, "");
+      } catch (e) {
+        if (rep) rep.fin("Vistas y tiendas al día", false, e.message);
+        MiseLogger.warn("reconciliarSemanaCompleta", `Error refrescando vistas: ${e.message}`);
+      }
+    }
+
+    const dur = MiseLogger.timeEnd(tId);
+    MiseLogger.info("reconciliarSemanaCompleta", `Reconciliación (solo registros, ${dias.length} días pasados): ${granTotalDescontados} insumos descontados, ${granTotalOmitidos} ya aplicados.`, dur);
+
+    if (!silent) {
+      let msg = `Días revisados: ${dias.length ? dias.map(f => `${f.getDate()}/${f.getMonth() + 1}`).join(", ") : "ninguno (la semana activa empieza hoy)"}\n` +
+        "Fuente: 🗒 LOG_SURTIDO de cada tienda. El pedido en curso de hoy no se toca.\n\n" +
+        `Insumos descontados ahora: ${granTotalDescontados}\nYa estaban aplicados (se omitieron): ${granTotalOmitidos}\n\n`;
+      msg += desgloseDias.length ? "Desglose por día:\n" + desgloseDias.join("\n") : "ℹ️ No había surtidos pendientes de descontar en los días pasados.";
+      SpreadsheetApp.getUi().alert("🔄 Reconciliación de la semana (días pasados)", msg, SpreadsheetApp.getUi().ButtonSet.OK);
+    }
+    return { dias: dias.length, totalDescontados: granTotalDescontados, totalOmitidos: granTotalOmitidos, desgloseDias };
+  },
+
+};
+
+// ── 4. MOTOR MATEMÁTICO UNIVERSAL DE MATCHING (MISE MATCHING ENGINE) ──────────
+const MiseMatchingEngine = {
+  SHEET_ALIAS: "_DICCIONARIO_ALIAS",
+
+  _asegurarHojaAlias(ss) {
+    let sheet = _hoja(ss, this.SHEET_ALIAS);
+    if (!sheet) {
+      sheet = ss.insertSheet(this.SHEET_ALIAS);
+      sheet.appendRow(["ALIAS_NORMALIZADO", "PRODUCTO_OFICIAL", "CONFIANZA", "FECHA_REGISTRO", "ORIGEN"]);
+      sheet.getRange(1, 1, 1, 5).setBackground("#2C3E50").setFontColor("#FFFFFF").setFontWeight("bold");
+      sheet.setFrozenRows(1);
+      try { sheet.hideSheet(); } catch(e) {}
+    }
+    return sheet;
+  },
+
+  /**
+   * Carga el diccionario persistente de alias desde la hoja oculta en memoria RAM.
+   */
+  obtenerDiccionarioAlias(ss) {
+    const sheet = _hoja(ss, this.SHEET_ALIAS);
+    if (!sheet || sheet.getLastRow() < 2) return {};
+    const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, 2).getValues();
+    const dict = {};
+    data.forEach(row => {
+      const alias = String(row[0] || "").trim().toLowerCase();
+      const oficial = String(row[1] || "").trim();
+      if (alias && oficial) dict[alias] = oficial;
+    });
+    return dict;
+  },
+
+  /**
+   * Registra un nuevo alias aprobado en el diccionario permanente.
+   */
+  registrarAlias(ss, alias, productoOficial, confianza = 1.0, origen = "AUTÓNOMO") {
+    if (!alias || !productoOficial) return;
+    const sheet = this._asegurarHojaAlias(ss);
+    const aliasNorm = this.sanitizarTexto(alias);
+    sheet.appendRow([aliasNorm, productoOficial, `${Math.round(confianza * 100)}%`, new Date(), origen]);
+  },
+
+  /**
+   * Limpieza de texto de alta precisión: remueve puntuación, acentos y unidades de medida comunes.
+   */
+  sanitizarTexto(str) {
+    if (!str) return "";
+    let s = String(str).toLowerCase()
+      .normalize("NFD").replace(/[\u0300-\u036f]/g, "") // Sin acentos
+      .replace(/\./g, " ") // Convertir puntos a espacios para que "Jam." sea "jam " y ".450" sea " 450"
+      // Remover expresiones de peso y empaque
+      .replace(/\b(\d+(\.\d+)?\s*(kg|g|gr|lt|l|ml|oz|pz|pza|piezas|paq|bot|man|dom|bol|fco|lat|rol|roll))\b/gi, " ")
+      .replace(/\b\d+\b/g, " ") // Remover números puros residuales (ej: 450, 170)
+      .replace(/[^a-z0-9\s]/gi, " ") // Caracteres especiales
+      .replace(/\s+/g, " ").trim();
+    return s;
+  },
+
+  /**
+   * Genera Q-Grams (N-Grams de 2 y 3 letras) para similitud morfológica tolerante a errores y abreviaciones.
+   */
+  _obtenerNGrams(str) {
+    const s = ` ${str} `;
+    const ngrams = new Set();
+    // Bigramas
+    for (let i = 0; i < s.length - 1; i++) {
+      ngrams.add(s.substring(i, i + 2));
+    }
+    // Trigramas
+    for (let i = 0; i < s.length - 2; i++) {
+      ngrams.add(s.substring(i, i + 3));
+    }
+    return ngrams;
+  },
+
+  /**
+   * Calcula Similitud Jaccard sobre N-Grams.
+   */
+  _similitudNGram(s1, s2) {
+    if (s1 === s2) return 1.0;
+    const set1 = this._obtenerNGrams(s1);
+    const set2 = this._obtenerNGrams(s2);
+    let intersection = 0;
+    set1.forEach(ng => {
+      if (set2.has(ng)) intersection++;
+    });
+    const union = set1.size + set2.size - intersection;
+    return union > 0 ? (intersection / union) : 0;
+  },
+
+  /**
+   * Token Sort Ratio: Independencia estricta del orden de palabras.
+   */
+  _tokenSortRatio(s1, s2) {
+    const tokens1 = s1.split(" ").filter(t => t.length > 0).sort().join(" ");
+    const tokens2 = s2.split(" ").filter(t => t.length > 0).sort().join(" ");
+    return this._similitudNGram(tokens1, tokens2);
+  },
+
+  /**
+   * Token Overlap Ratio: Porcentaje de palabras clave cubiertas con tolerancia a prefijos/abreviaciones.
+   */
+  _tokenOverlap(s1, s2) {
+    // Filtrar palabras irrelevantes como 'de', 'en', 'con', 'y', 'el', 'la'
+    const stopwords = new Set(["de", "en", "con", "y", "el", "la", "los", "las", "un", "una", "del"]);
+    const arr1 = s1.split(" ").filter(t => t.length >= 2 && !stopwords.has(t));
+    const arr2 = s2.split(" ").filter(t => t.length >= 2 && !stopwords.has(t));
+    if (arr1.length === 0 || arr2.length === 0) return 0;
+    
+    let matches = 0;
+    arr1.forEach(t1 => {
+      // Coincidencia exacta o coincidencia por prefijo/subcadena de al menos 3 caracteres (ej. choc vs chocolate, jam vs jamon)
+      const matched = arr2.some(t2 => {
+        if (t1 === t2) return true;
+        if (t1.length >= 3 && t2.startsWith(t1)) return true;
+        if (t2.length >= 3 && t1.startsWith(t2)) return true;
+        if (t1.length >= 4 && t2.includes(t1)) return true;
+        if (t2.length >= 4 && t1.includes(t2)) return true;
+        return false;
+      });
+      if (matched) matches++;
+    });
+    return matches / Math.max(arr1.length, arr2.length);
+  },
+
+  /**
+   * Calcula el score compuesto (0.0 a 1.0) entre un texto y un producto oficial.
+   */
+  calcularScore(inputStr, oficialStr) {
+    const sInput = this.sanitizarTexto(inputStr);
+    const sOficial = this.sanitizarTexto(oficialStr);
+
+    if (!sInput || !sOficial) return 0;
+    if (sInput === sOficial) return 1.0;
+
+    const nGramScore = this._similitudNGram(sInput, sOficial);
+    const tokenSortScore = this._tokenSortRatio(sInput, sOficial);
+    const overlapScore = this._tokenOverlap(sInput, sOficial);
+
+    // Ponderación de alta fidelidad: Overlap semántico tiene mayor peso para abreviaciones
+    const finalScore = (overlapScore * 0.50) + (nGramScore * 0.25) + (tokenSortScore * 0.25);
+    return Math.min(1.0, finalScore);
+  },
+
+  /**
+   * Encuentra el mejor producto oficial para un texto ingresado.
+   * Aplica evaluación de Margen de Victoria (Delta) para prevenir empates y ambigüedades.
+   */
+  evaluarMatch(inputStr, listaOficiales, aliasDict = {}) {
+    if (!inputStr) return { match: null, score: 0, delta: 0, candidato: null, estado: 'DESCONOCIDO' };
+    
+    const inputSanitizado = this.sanitizarTexto(inputStr);
+
+    // 1. Caché L1 en _DICCIONARIO_ALIAS
+    if (aliasDict[inputSanitizado]) {
+      return { match: aliasDict[inputSanitizado], score: 1.0, delta: 1.0, candidato: aliasDict[inputSanitizado], estado: 'MATCH' };
+    }
+
+    // 2. Coincidencia exacta sanitizada directa
+    for (const oficial of listaOficiales) {
+      if (this.sanitizarTexto(oficial) === inputSanitizado) {
+        return { match: oficial, score: 1.0, delta: 1.0, candidato: oficial, estado: 'MATCH' };
+      }
+    }
+
+    // 3. Matriz de Evaluación Matemática contra todos los oficiales
+    const ranking = [];
+    for (const oficial of listaOficiales) {
+      const score = this.calcularScore(inputStr, oficial);
+      ranking.push({ oficial, score });
+    }
+
+    ranking.sort((a, b) => b.score - a.score);
+
+    const top1 = ranking[0] || { oficial: null, score: 0 };
+    const top2 = ranking[1] || { oficial: null, score: 0 };
+    const delta = top1.score - top2.score;
+
+    // Umbrales de Confianza y No-Ambigüedad:
+    // MATCH SEGURO: Score >= 0.55 y Delta >= 0.10 (o Score >= 0.75)
+    if ((top1.score >= 0.55 && delta >= 0.10) || top1.score >= 0.75) {
+      return { match: top1.oficial, score: top1.score, delta, candidato: top1.oficial, estado: 'MATCH' };
+    }
+
+    // Caso AMBIGUO (Empate o coincidencia media)
+    if (top1.score >= 0.35) {
+      return { match: null, score: top1.score, delta, candidato: top1.oficial, segundoCandidato: top2.oficial, estado: 'AMBIGUO' };
+    }
+
+    // Caso DESCONOCIDO TOTAL
+    return { match: null, score: top1.score, delta, candidato: top1.oficial, estado: 'DESCONOCIDO' };
+  }
+};
+
+// ── 5. MOTOR TRANSACCIONAL DE TRASPASOS INTER-TIENDAS (MISE TRASPASOS) ────────
+
+const MiseTraspasos = {
+  /**
+   * Asegura la existencia y encabezados de la hoja 🔄 TRASPASOS en Bodega Central
+   */
+  _asegurarHojaTraspasos(ss) {
+    let sheet = _hoja(ss, SHEET_TRASPASOS);
+    if (!sheet) {
+      sheet = ss.insertSheet(SHEET_TRASPASOS);
+      const headers = [
+        ["FOLIO", "FECHA_HORA", "ORIGEN", "DESTINO", "PRODUCTO", "CANTIDAD", "UNIDAD", "FACTOR_KARDEX", "CANT_KARDEX", "MOTIVO", "USUARIO"]
+      ];
+      sheet.getRange(1, 1, 1, 11).setValues(headers)
+        .setBackground("#3D5A47").setFontColor("#FFFFFF").setFontWeight("bold")
+        .setFontSize(10).setFontFamily("Arial").setHorizontalAlignment("center").setVerticalAlignment("middle");
+      sheet.setRowHeight(1, 28);
+      sheet.setFrozenRows(1);
+      
+      sheet.setColumnWidth(1, 110); // FOLIO
+      sheet.setColumnWidth(2, 140); // FECHA_HORA
+      sheet.setColumnWidth(3, 90);  // ORIGEN
+      sheet.setColumnWidth(4, 90);  // DESTINO
+      sheet.setColumnWidth(5, 230); // PRODUCTO
+      sheet.setColumnWidth(6, 85);  // CANTIDAD
+      sheet.setColumnWidth(7, 85);  // UNIDAD
+      sheet.setColumnWidth(8, 100); // FACTOR_KARDEX
+      sheet.setColumnWidth(9, 100); // CANT_KARDEX
+      sheet.setColumnWidth(10, 160);// MOTIVO
+      sheet.setColumnWidth(11, 130);// USUARIO
+    }
+    return sheet;
+  },
+
+  /**
+   * Registra y aplica un traspaso atómico entre sucursales
+   * @param {Object} payload { origen: 'BA'|'BM', destino: 'BA'|'BM', producto: string, cantidad: number, unidad: string, motivo: string, usuario: string }
+   */
+  registrar(payload) {
+    const lock = LockService.getScriptLock();
+    if (!lock.tryLock(20000)) {
+      throw new Error("El sistema de traspasos está ocupado. Intenta de nuevo.");
+    }
+
+    try {
+      const ss = SpreadsheetApp.getActiveSpreadsheet();
+      const origenKey = String(payload.origen || "").trim().toUpperCase();
+      const destinoKey = String(payload.destino || "").trim().toUpperCase();
+      const prodName = String(payload.producto || "").trim();
+      const cant = parseFloat(payload.cantidad);
+      const unidad = String(payload.unidad || "").trim();
+      const motivo = String(payload.motivo || "Traspaso de emergencia").trim();
+      const usuario = String(payload.usuario || Session.getActiveUser().getEmail() || "Encargado").trim();
+
+      if (!origenKey || !destinoKey || origenKey === destinoKey) {
+        throw new Error("Las sucursales de origen y destino deben ser distintas (BA vs BM).");
+      }
+      if (!BODEGAS[origenKey] || !BODEGAS[destinoKey]) {
+        throw new Error(`Sucursal inválida: ${origenKey} -> ${destinoKey}`);
+      }
+      if (!prodName) {
+        throw new Error("Debes especificar un producto válido.");
+      }
+      if (isNaN(cant) || cant <= 0) {
+        throw new Error("La cantidad debe ser un número positivo mayor a 0.");
+      }
+
+      // 1. Mapear producto en Kardex y factores de conversión
+      const normKey = String(prodName).toLowerCase().replace(/\s+/g, "").replace(/cdk/g, "").replace(/[()]/g, "").trim();
+      const maestroSheet = _hoja(ss, SHEET_MAESTRO);
+      let factorConversion = 1;
+      if (maestroSheet) {
+        const mlr = maestroSheet.getLastRow();
+        if (mlr >= MAESTRO_START) {
+          const mapM = _getMaestroHeaderMap(maestroSheet);
+          const cProdM = mapM["PRODUCTO"] ? mapM["PRODUCTO"].index : 2;
+          const cFactM = mapM["FACTOR_CONVERSION"] ? mapM["FACTOR_CONVERSION"].index : -1;
+          if (cFactM !== -1) {
+            const mData = maestroSheet.getRange(MAESTRO_START, 1, mlr - MAESTRO_START + 1, maestroSheet.getLastColumn()).getValues();
+            for (let i = 0; i < mData.length; i++) {
+              const pNorm = String(mData[i][cProdM]).toLowerCase().replace(/\s+/g, "").replace(/cdk/g, "").replace(/[()]/g, "").trim();
+              if (pNorm === normKey) {
+                let fact = mData[i][cFactM];
+                if (typeof fact === "string") fact = fact.replace(',', '.').trim();
+                const numFact = parseFloat(fact);
+                if (!isNaN(numFact) && numFact > 0) factorConversion = numFact;
+                break;
+              }
+            }
+          }
+        }
+      }
+
+      const cantKardex = Math.round(cant * factorConversion * 1000) / 1000;
+
+      // 2. Localizar filas en Kardex de Origen y Destino
+      const kSheetOrigen = _hoja(ss, BODEGAS[origenKey].kardex);
+      const kSheetDestino = _hoja(ss, BODEGAS[destinoKey].kardex);
+      if (!kSheetOrigen || !kSheetDestino) {
+        throw new Error("No se encontraron las hojas de Kardex de origen o destino.");
+      }
+
+      const klrOri = kSheetOrigen.getLastRow();
+      const klrDes = kSheetDestino.getLastRow();
+      if (klrOri < KARDEX_START || klrDes < KARDEX_START) {
+        throw new Error("Kardex vacío o no inicializado.");
+      }
+
+      const prodsOri = kSheetOrigen.getRange(KARDEX_START, 3, klrOri - KARDEX_START + 1, 1).getValues();
+      const prodsDes = kSheetDestino.getRange(KARDEX_START, 3, klrDes - KARDEX_START + 1, 1).getValues();
+
+      let rowOri = -1;
+      let rowDes = -1;
+      let nombreOficialOri = prodName;
+      let nombreOficialDes = prodName;
+
+      for (let i = 0; i < prodsOri.length; i++) {
+        const pNorm = String(prodsOri[i][0]).toLowerCase().replace(/\s+/g, "").replace(/cdk/g, "").replace(/[()]/g, "").trim();
+        if (pNorm === normKey) {
+          rowOri = KARDEX_START + i;
+          nombreOficialOri = prodsOri[i][0];
+          break;
+        }
+      }
+
+      for (let i = 0; i < prodsDes.length; i++) {
+        const pNorm = String(prodsDes[i][0]).toLowerCase().replace(/\s+/g, "").replace(/cdk/g, "").replace(/[()]/g, "").trim();
+        if (pNorm === normKey) {
+          rowDes = KARDEX_START + i;
+          nombreOficialDes = prodsDes[i][0];
+          break;
+        }
+      }
+
+      if (rowOri === -1 || rowDes === -1) {
+        throw new Error(`El producto "${prodName}" no fue localizado en ambos Kardex.`);
+      }
+
+      // 3. Determinar columna según día de la semana (LUN=0 ... DOM=6)
+      const hoy = new Date();
+      const dow = hoy.getDay();
+      const dIdx = dow === 0 ? 6 : dow - 1;
+      const entColIdx = 10 + dIdx * 3;     // Columna ENT de hoy
+      const salColIdx = 10 + dIdx * 3 + 1; // Columna SAL de hoy
+
+      // Acreditar salida en Origen
+      const valSalOri = parseFloat(kSheetOrigen.getRange(rowOri, salColIdx).getValue()) || 0;
+      kSheetOrigen.getRange(rowOri, salColIdx).setValue(valSalOri + cantKardex);
+
+      // Acreditar entrada en Destino
+      const valEntDes = parseFloat(kSheetDestino.getRange(rowDes, entColIdx).getValue()) || 0;
+      kSheetDestino.getRange(rowDes, entColIdx).setValue(valEntDes + cantKardex);
+
+      // 4. Registrar en hoja central 🔄 TRASPASOS
+      const traspasosSheet = this._asegurarHojaTraspasos(ss);
+      const folio = "TRP-" + Utilities.formatDate(hoy, "GMT-6", "yyyyMMdd-HHmmss");
+      const fechaStr = Utilities.formatDate(hoy, "GMT-6", "yyyy-MM-dd HH:mm:ss");
+
+      const logRow = [
+        folio,
+        fechaStr,
+        BODEGAS[origenKey].nombre,
+        BODEGAS[destinoKey].nombre,
+        nombreOficialOri,
+        cant,
+        unidad || "PZ",
+        factorConversion,
+        cantKardex,
+        motivo,
+        usuario
+      ];
+
+      const nextRow = traspasosSheet.getLastRow() + 1;
+      traspasosSheet.getRange(nextRow, 1, 1, 11).setValues([logRow]);
+      const bg = (nextRow % 2 === 0) ? "#FAFAFA" : "#FFFFFF";
+      traspasosSheet.getRange(nextRow, 1, 1, 11).setBackground(bg).setFontSize(9).setFontFamily("Calibri").setVerticalAlignment("middle");
+      traspasosSheet.getRange(nextRow, 1).setHorizontalAlignment("center").setFontWeight("bold");
+      traspasosSheet.getRange(nextRow, 2).setHorizontalAlignment("center");
+      traspasosSheet.getRange(nextRow, 3, 1, 2).setHorizontalAlignment("center").setFontWeight("bold");
+      traspasosSheet.getRange(nextRow, 6, 1, 4).setHorizontalAlignment("right");
+
+      // Actualizar vistas móviles silenciosamente
+      try {
+        _buildVista("BA");
+        _buildVista("BM");
+      } catch(eVista) {}
+
+      MiseLogger.info("MiseTraspasos.registrar", `Folio ${folio}: ${cant} ${unidad} (${cantKardex} Kardex) de ${origenKey} a ${destinoKey} (${nombreOficialOri})`);
+
+      return {
+        success: true,
+        folio: folio,
+        mensaje: `Traspaso ${folio} registrado con éxito:\n• ${cant} ${unidad} de ${BODEGAS[origenKey].nombre} ➔ ${BODEGAS[destinoKey].nombre}\n• Movimiento Kardex: ${cantKardex}`
+      };
+    } finally {
+      lock.releaseLock();
+    }
+  }
+};
+
+/**
+ * Endpoint global invocable desde UI o RPC para ejecutar un traspaso
+ */
+function registrarTraspasoRPC(payload) {
+  return MiseTraspasos.registrar(payload);
+}
+
+
+// Estado para 🗒 LOG_SURTIDO: el de la tienda si es válido (un "#NAME?" o texto roto no cuenta); si no, lo que
+// marcó el Surtido (✅/❌); si no, se deduce de la cantidad descontada; sin nada registrado → SIN_REGISTRO.
+function _estadoLogSurtido(estado, sInfo, cantPed, cantDeducir) {
+  const t = String(estado || "").toUpperCase();
+  const valido = ["INEXISTENTE", "EXCEDENTE", "PARCIAL", "COMPLETO"].find(k => t.indexOf(k) !== -1);
+  if (valido) return valido;
+  if (sInfo && sInfo.sInex) return "INEXISTENTE";
+  if (sInfo && sInfo.sComp) return "COMPLETO";
+  if (cantDeducir > 0) return cantDeducir === cantPed ? "COMPLETO" : (cantDeducir > cantPed ? "EXCEDENTE" : "PARCIAL");
+  return "SIN_REGISTRO";
+}
+
+// Garantiza el encabezado de 🗒 LOG_SURTIDO en la fila 1 (7 columnas; "EsAdición" retirada en 1.7.6e).
+// Si una escritura previa cayó en la fila 1 (hoja vacía + getLastRow()+1), inserta una fila arriba.
+function _asegurarEncabezadoLogSurtido(logSheet) {
+  if (String(logSheet.getRange(1, 1).getValue()).trim() !== "Fecha") {
+    if (logSheet.getLastRow() >= 1) logSheet.insertRowBefore(1);
+    logSheet.getRange(1, 1, 1, 7).setValues([["Fecha", "Bodega", "Producto", "Categoría", "Cant.Pedida", "Cant.Recibida", "Estado"]])
+      .setBackground("#3D5A47").setFontColor("#FFFFFF").setFontWeight("bold");
+    logSheet.setFrozenRows(1);
+  }
+  if (String(logSheet.getRange(1, 8).getValue()).trim() === "EsAdición") logSheet.getRange(1, 8).clearContent().setBackground(null);
+}
